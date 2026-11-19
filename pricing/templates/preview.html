@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}选择编码 · 旧报纸价目表录入{% endblock %}
+{% block content %}
+<section class="card">
+  <h1>选择文件编码</h1>
+  <p>
+    文件 <strong>{{ filename }}</strong> 可以按多种编码读取，且读出的文字框不一致。
+    请对照下方实际有差异的框，选择文字正确（无乱码）的一种读法；
+    <strong>选定编码后才会创建任务</strong>。
+  </p>
+</section>
+
+<section class="card">
+  <div class="panel-head">
+    <h2>读法差异</h2>
+    <span class="muted">
+      共 {{ diff_total }} 个框有差异{% if diff_total > diff_rows|length %}，仅显示前 {{ diff_rows|length }} 个{% endif %}
+    </span>
+  </div>
+  <table class="encoding-diff">
+    <thead>
+      <tr>
+        <th>框序</th>
+        {% for reading in usable %}<th>{{ reading.label }}</th>{% endfor %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in diff_rows %}
+      <tr>
+        <td class="muted">#{{ row.row_no }}</td>
+        {% for reading in usable %}
+        <td>
+          {% set box = row.cells[reading.encoding] %}
+          {% if box %}
+          <div class="diff-text">{{ box.text }}</div>
+          <div class="muted">框号 {{ box.box_ref }} · {{ box.x1 }}, {{ box.y1 }}, {{ box.x2 }}, {{ box.y2 }}</div>
+          {% else %}
+          <span class="muted">（此读法缺少该框）</span>
+          {% endif %}
+        </td>
+        {% endfor %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="card">
+  <h2>确认读法</h2>
+  <div class="reading-options">
+    {% for reading in usable %}
+    <form method="post" action="{{ url_for('confirm_upload', token=token) }}">
+      <input type="hidden" name="encoding" value="{{ reading.encoding }}">
+      <div class="reading-head">
+        <button type="submit" class="primary">使用 {{ reading.label }} 导入</button>
+        <span class="muted">{{ reading.parsed.boxes|length }} 个文字框</span>
+      </div>
+      {% if reading.parsed.warnings %}
+      <ul class="reading-warnings">
+        {% for warning in reading.parsed.warnings[:5] %}
+        <li>{{ warning }}</li>
+        {% endfor %}
+        {% if reading.parsed.warnings|length > 5 %}
+        <li class="muted">……另有 {{ reading.parsed.warnings|length - 5 }} 条坏行提示</li>
+        {% endif %}
+      </ul>
+      {% endif %}
+    </form>
+    {% endfor %}
+  </div>
+  {% if failed %}
+  <h3>不可用的读法</h3>
+  <ul class="reading-warnings">
+    {% for reading in failed %}
+    <li>{{ reading.label }}：{{ reading.error.message }}</li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+  <p class="muted"><a href="{{ url_for('index') }}">取消并返回任务列表</a></p>
+</section>
+{% endblock %}

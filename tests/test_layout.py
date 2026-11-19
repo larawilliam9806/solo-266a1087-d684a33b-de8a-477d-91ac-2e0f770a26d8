@@ -8,7 +8,14 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from pricing import layout  # noqa: E402
-from pricing.csvparse import CsvError, parse_csv  # noqa: E402
+from pricing.csvparse import (  # noqa: E402
+    CsvError,
+    diff_boxes,
+    parse_csv,
+    parse_readings,
+    readings_agree,
+    usable_readings,
+)
 
 
 def make_box(box_id, ref, text, x1, y1, x2, y2):
@@ -322,6 +329,59 @@ class CsvParseTests(unittest.TestCase):
     def test_missing_text_column_rejected(self):
         with self.assertRaises(CsvError):
             parse_csv(csv_bytes("框号,x1,y1,x2,y2\n1,1,2,3,4\n"))
+
+
+class UploadReadingTests(unittest.TestCase):
+    def test_bom_file_only_has_utf8_reading(self):
+        raw = "﻿框号,文字,x1,y1,x2,y2\n1,糖,1,2,3,4\n".encode("utf-8")
+        readings = parse_readings(raw)
+        self.assertEqual([reading.label for reading in readings], ["UTF-8（含 BOM）"])
+        self.assertEqual(readings[0].parsed.boxes[0]["text"], "糖")
+
+    def test_bom_with_invalid_utf8_has_no_reading(self):
+        raw = b"\xef\xbb\xbf" + "框号,文字\n1,".encode("utf-8") + b"\xff\xfe\n"
+        self.assertEqual(parse_readings(raw), [])
+
+    def test_big5_and_gb18030_readings_differ(self):
+        raw = "框號,文字,x1,y1,x2,y2\n1,青菜,10,10,90,40\n".encode("big5")
+        usable = usable_readings(parse_readings(raw))
+        self.assertEqual([reading.encoding for reading in usable],
+                         ["big5", "gb18030"])
+        self.assertFalse(readings_agree(usable))
+        self.assertEqual(usable[0].parsed.boxes[0]["text"], "青菜")
+        self.assertEqual(usable[1].parsed.boxes[0]["text"], "獵垫")
+
+    def test_utf8_chinese_csv_has_single_reading(self):
+        raw = "框号,文字,x1,y1,x2,y2\n1,白砂糖,10,10,90,40\n".encode("utf-8")
+        usable = usable_readings(parse_readings(raw))
+        self.assertEqual([reading.encoding for reading in usable], ["utf-8"])
+
+    def test_ascii_readings_all_agree(self):
+        usable = usable_readings(parse_readings(
+            b"box,text,x1,y1,x2,y2\n1,abc,1,2,3,4\n"))
+        self.assertEqual(len(usable), 3)
+        self.assertTrue(readings_agree(usable))
+
+    def test_undecodable_bytes_have_no_reading(self):
+        self.assertEqual(parse_readings(b"\xff\xff\xff"), [])
+
+    def test_unparseable_reading_carries_error(self):
+        readings = parse_readings("没有坐标的内容\n".encode("utf-8"))
+        self.assertEqual(usable_readings(readings), [])
+        self.assertTrue(readings)
+        self.assertTrue(all(reading.error is not None for reading in readings))
+
+    def test_diff_boxes_lists_only_differing_rows(self):
+        raw = ("框號,文字,x1,y1,x2,y2\n"
+               "1,青菜,10,10,90,40\n"
+               "2,5.00,210,10,290,40\n").encode("big5")
+        usable = usable_readings(parse_readings(raw))
+        rows = diff_boxes(usable)
+        # 5.00 是纯 ASCII，两种读法一致；只有 青菜 这一框有差异。
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["row_no"], 1)
+        self.assertEqual(rows[0]["cells"]["big5"]["text"], "青菜")
+        self.assertEqual(rows[0]["cells"]["gb18030"]["text"], "獵垫")
 
 
 if __name__ == "__main__":

@@ -43,3 +43,17 @@ CREATE TABLE IF NOT EXISTS decisions (
     created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (job_id, box_id)
 );
+
+-- Uploads whose encodings decode to different results and are therefore
+-- waiting for the user to pick a reading.  The raw bytes are stored so the
+-- confirm step always imports exactly the file that was previewed in that
+-- window, even when two windows upload files with the same name.  `job_id`
+-- is filled in by the confirm step inside the import transaction, which
+-- makes repeated confirms of the same preview idempotent.
+CREATE TABLE IF NOT EXISTS pending_uploads (
+    token       TEXT PRIMARY KEY,
+    filename    TEXT    NOT NULL,
+    raw         BLOB    NOT NULL,
+    job_id      INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+    created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);

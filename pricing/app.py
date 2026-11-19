@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import io
 import os
+import secrets
 from pathlib import Path
 from urllib.parse import quote
 
@@ -28,9 +29,16 @@ from flask import (
 
 from . import db
 from . import layout
-from .csvparse import CsvError, parse_csv
+from .csvparse import (
+    diff_boxes,
+    has_utf8_bom,
+    parse_readings,
+    readings_agree,
+    usable_readings,
+)
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_DIFF_ROWS = 100
 
 
 def create_app(config=None):
@@ -156,21 +164,95 @@ def create_app(config=None):
         if len(raw) > MAX_UPLOAD_BYTES:
             flash("文件过大（上限 10MB）", "error")
             return redirect(url_for("index"))
-        try:
-            parsed = parse_csv(raw)
-        except CsvError as error:
-            for line in [error.message] + error.details:
+
+        # 编码判断：含 UTF-8 BOM 只按 UTF-8 严格解码，其余分别尝试
+        # UTF-8、Big5、GB18030 的严格解码，每种读法都按现有 CSV 格式解析。
+        readings = parse_readings(raw)
+        usable = usable_readings(readings)
+        if not usable:
+            for line in _reading_failure_lines(raw, readings):
                 flash(line, "error")
             return redirect(url_for("index"))
 
-        connection = get_db()
-        job_id = db.create_job(connection, filename)
-        db.add_boxes(connection, job_id, parsed.boxes)
-        horizontal, vertical = _suggest_lines(parsed.boxes)
-        db.set_lines(connection, job_id, horizontal, vertical)
-        for warning in parsed.warnings[:20]:
-            flash(warning, "warning")
-        flash(f"已导入 {len(parsed.boxes)} 个文字框，请核对格线", "success")
+        if not readings_agree(usable):
+            # 多种读法结果不一致：先对照差异、选定编码，确认后才创建任务。
+            token = secrets.token_urlsafe(16)
+            db.create_pending_upload(get_db(), token, filename, raw)
+            return redirect(url_for("preview_upload", token=token))
+
+        try:
+            job_id = _import_reading(get_db(), filename, usable[0], token=None)
+        except Exception:
+            app.logger.exception("导入失败")
+            flash("导入失败，未创建任务", "error")
+            return redirect(url_for("index"))
+        _flash_reading_notes(usable[0])
+        return redirect(url_for("job_view", job_id=job_id))
+
+    @app.get("/uploads/<token>")
+    def preview_upload(token):
+        pending = db.get_pending_upload(get_db(), token)
+        if pending is None:
+            abort(404)
+        if pending["job_id"] is not None:
+            # 该预览已确认过，直接打开已创建的任务。
+            return redirect(url_for("job_view", job_id=pending["job_id"]))
+        readings = parse_readings(pending["raw"])
+        usable = usable_readings(readings)
+        if not usable:
+            flash("该文件没有可用的读法，请重新上传", "error")
+            return redirect(url_for("index"))
+        if readings_agree(usable):
+            # 防御性分支：读法结果一致时无需选择，直接导入。
+            try:
+                job_id = _import_reading(get_db(), pending["filename"], usable[0], token)
+            except Exception:
+                app.logger.exception("导入失败")
+                flash("导入失败，未创建任务", "error")
+                return redirect(url_for("index"))
+            if job_id is None:
+                pending = db.get_pending_upload(get_db(), token)
+                return redirect(url_for("job_view", job_id=pending["job_id"]))
+            _flash_reading_notes(usable[0])
+            return redirect(url_for("job_view", job_id=job_id))
+        rows = diff_boxes(usable)
+        return render_template(
+            "preview.html",
+            token=token,
+            filename=pending["filename"],
+            usable=usable,
+            failed=[reading for reading in readings if reading.parsed is None],
+            diff_rows=rows[:MAX_DIFF_ROWS],
+            diff_total=len(rows),
+        )
+
+    @app.post("/uploads/<token>/confirm")
+    def confirm_upload(token):
+        pending = db.get_pending_upload(get_db(), token)
+        if pending is None:
+            abort(404)
+        if pending["job_id"] is not None:
+            # 同一预览重复确认：回到第一次创建的任务，不再导入。
+            return redirect(url_for("job_view", job_id=pending["job_id"]))
+        # 重新解析服务器保存的原始字节，保证导入的就是该窗口预览的那份文件。
+        readings = parse_readings(pending["raw"])
+        encoding = request.form.get("encoding", "")
+        reading = next((item for item in usable_readings(readings)
+                        if item.encoding == encoding), None)
+        if reading is None:
+            flash("所选读法不可用，请重新选择", "error")
+            return redirect(url_for("preview_upload", token=token))
+        try:
+            job_id = _import_reading(get_db(), pending["filename"], reading, token)
+        except Exception:
+            app.logger.exception("导入失败")
+            flash("导入失败，未创建任务，请重试", "error")
+            return redirect(url_for("preview_upload", token=token))
+        if job_id is None:
+            # 另一处已确认了同一份预览。
+            pending = db.get_pending_upload(get_db(), token)
+            return redirect(url_for("job_view", job_id=pending["job_id"]))
+        _flash_reading_notes(reading)
         return redirect(url_for("job_view", job_id=job_id))
 
     @app.get("/jobs/<int:job_id>")
@@ -318,6 +400,40 @@ def _json_state(state):
 
 def _quote_filename(name):
     return quote(name)
+
+
+def _reading_failure_lines(raw, readings):
+    """Explain why an upload produced no usable reading."""
+    if not readings:
+        if has_utf8_bom(raw):
+            return ["文件带有 UTF-8 BOM，但内容不是有效的 UTF-8，无法读取"]
+        return ["无法读取文件：按 UTF-8、Big5、GB18030 严格解码均失败"]
+    lines = ["文件内容无法按现有 CSV 格式读取："]
+    for reading in readings:
+        lines.append(f"{reading.label}：{reading.error.message}")
+        lines.extend(reading.error.details)
+    return lines
+
+
+def _import_reading(connection, filename, reading, token):
+    """Create the job for one reading in a single transaction.
+
+    Returns the new job id, or None when the pending upload was already
+    confirmed elsewhere (the half-inserted job has been rolled back).
+    """
+    horizontal, vertical = _suggest_lines(reading.parsed.boxes)
+    return db.create_job_from_upload(
+        connection, token, filename, reading.parsed.boxes, horizontal, vertical
+    )
+
+
+def _flash_reading_notes(reading):
+    for warning in reading.parsed.warnings[:20]:
+        flash(warning, "warning")
+    flash(
+        f"已按 {reading.label} 导入 {len(reading.parsed.boxes)} 个文字框，请核对格线",
+        "success",
+    )
 
 
 def _suggest_lines(boxes):

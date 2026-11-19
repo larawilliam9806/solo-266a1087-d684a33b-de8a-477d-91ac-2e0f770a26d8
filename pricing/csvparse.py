@@ -11,10 +11,18 @@ English, with spaces/underscores/punctuation ignored):
 The rectangle coordinates may be written as four separate columns or packed
 into one column (``1,2,100,50`` / ``[1,2,100,50]``).  A CSV without a header
 is read positionally as 框号, 文字, x1, y1, x2, y2.
+
+Upload decoding: a file with a UTF-8 BOM is read strictly as UTF-8 and
+nothing else; any other file is tried strictly as UTF-8, Big5 and GB18030.
+Every decoding is parsed with the same CSV rules and bad-row warnings, so
+the upload flow can compare the resulting boxes (框号/文字/坐标) and ask the
+user to pick a reading when they disagree — a Big5 newspaper page must not
+silently become GB18030 mojibake (青菜 → 獵垫).
 """
 
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 import re
@@ -40,7 +48,15 @@ Y2_ALIASES = {"y2", "bottom", "ymax", "下", "下边界", "右下y", "maxy", "en
 W_ALIASES = {"w", "width", "宽", "宽度"}
 H_ALIASES = {"h", "height", "高", "高度"}
 
+# Legacy heuristic used by parse_csv() for direct library calls.  The upload
+# flow does NOT use this: it goes through parse_readings() instead.
 ENCODINGS = ("utf-8-sig", "gb18030", "utf-8", "big5")
+
+# Upload decoding: BOM files are pinned to strict UTF-8; everything else is
+# tried strictly in this order.
+UPLOAD_ENCODINGS = ("utf-8", "big5", "gb18030")
+ENCODING_LABELS = {"utf-8": "UTF-8", "big5": "Big5", "gb18030": "GB18030"}
+UTF8_BOM_LABEL = "UTF-8（含 BOM）"
 
 NUMBER_RE = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
@@ -57,6 +73,20 @@ class ParsedCsv:
     boxes: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
     headers: list = field(default_factory=list)
+
+
+@dataclass
+class Reading:
+    """One decoding of an upload, parsed with the normal CSV rules.
+
+    Exactly one of ``parsed`` / ``error`` is set: a reading is usable when
+    its text parsed into at least one box.
+    """
+    encoding: str
+    label: str
+    text: str = ""
+    parsed: ParsedCsv | None = None
+    error: CsvError | None = None
 
 
 def _normalise(name):
@@ -177,8 +207,15 @@ def parse_csv(raw):
     Raises CsvError when the file has no usable rows or the header is
     unrecognisable.  Recoverable per-row problems become warnings and the row
     is skipped, so one malformed line does not lose an entire OCR page.
+
+    Bytes are decoded with the legacy first-match heuristic; the upload flow
+    uses parse_readings() instead, which keeps every strict decoding.
     """
-    text = _decode(raw)
+    return parse_text(_decode(raw))
+
+
+def parse_text(text):
+    """Parse decoded CSV text into normalised box rows (see parse_csv)."""
     if not text.strip():
         raise CsvError("文件为空")
 
@@ -248,3 +285,101 @@ def parse_csv(raw):
     if not boxes:
         raise CsvError("没有可用的文字框", warnings)
     return ParsedCsv(boxes=boxes, warnings=warnings, headers=[str(c) for c in header])
+
+
+# ---------------------------------------------------------------------------
+# Upload decoding: every strict reading of the same bytes
+# ---------------------------------------------------------------------------
+
+def has_utf8_bom(raw):
+    return isinstance(raw, (bytes, bytearray)) and raw.startswith(codecs.BOM_UTF8)
+
+
+def decode_upload(raw):
+    """Strict candidate decodings of an uploaded file.
+
+    A UTF-8 BOM pins the file to strict UTF-8 (the BOM is stripped); any
+    other bytes are tried strictly as UTF-8, Big5 and GB18030.  Returns a
+    list of (encoding, label, text) for the decodings that succeed — an
+    empty list means the bytes are not readable in any of them.
+    """
+    if isinstance(raw, str):
+        return [("utf-8", ENCODING_LABELS["utf-8"], raw)]
+    if has_utf8_bom(raw):
+        try:
+            return [("utf-8", UTF8_BOM_LABEL, raw.decode("utf-8-sig", errors="strict"))]
+        except UnicodeDecodeError:
+            return []
+    candidates = []
+    for encoding in UPLOAD_ENCODINGS:
+        try:
+            candidates.append(
+                (encoding, ENCODING_LABELS[encoding], raw.decode(encoding, errors="strict"))
+            )
+        except UnicodeDecodeError:
+            continue
+    return candidates
+
+
+def parse_readings(raw):
+    """Decode an upload every supported way and parse each reading.
+
+    Each returned Reading carries either a ParsedCsv (usable) or the CsvError
+    explaining why that reading is unusable.  Both use the same CSV format
+    and bad-row warnings as a normal parse.
+    """
+    readings = []
+    for encoding, label, text in decode_upload(raw):
+        try:
+            parsed = parse_text(text)
+        except CsvError as error:
+            readings.append(Reading(encoding=encoding, label=label, text=text,
+                                    error=error))
+        else:
+            readings.append(Reading(encoding=encoding, label=label, text=text,
+                                    parsed=parsed))
+    return readings
+
+
+def usable_readings(readings):
+    return [reading for reading in readings if reading.parsed is not None]
+
+
+def reading_signature(parsed):
+    """Fingerprint of a reading's 框号/文字/坐标, used to compare readings."""
+    return tuple(
+        (box["box_ref"], box["text"],
+         box["x1"], box["y1"], box["x2"], box["y2"])
+        for box in parsed.boxes
+    )
+
+
+def readings_agree(usable):
+    """True when every usable reading yields identical 框号/文字/坐标."""
+    if len(usable) < 2:
+        return True
+    first = reading_signature(usable[0].parsed)
+    return all(reading_signature(reading.parsed) == first for reading in usable[1:])
+
+
+def diff_boxes(usable):
+    """Position-aligned boxes where the usable readings disagree.
+
+    Each row is {"row_no", "cells": {encoding: box-or-None}}; rows where all
+    readings agree are omitted, so the page shows only 实际有差异的框.
+    """
+    length = max((len(reading.parsed.boxes) for reading in usable), default=0)
+    rows = []
+    for index in range(length):
+        cells = {}
+        seen = set()
+        for reading in usable:
+            boxes = reading.parsed.boxes
+            box = boxes[index] if index < len(boxes) else None
+            cells[reading.encoding] = box
+            seen.add(None if box is None else (
+                box["box_ref"], box["text"],
+                box["x1"], box["y1"], box["x2"], box["y2"]))
+        if len(seen) > 1:
+            rows.append({"row_no": index + 1, "cells": cells})
+    return rows

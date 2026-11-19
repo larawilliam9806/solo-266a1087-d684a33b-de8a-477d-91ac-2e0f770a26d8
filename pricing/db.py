@@ -146,3 +146,71 @@ def clear_decision(connection, job_id, box_id):
         "DELETE FROM decisions WHERE job_id = ? AND box_id = ?", (job_id, box_id)
     )
     connection.commit()
+
+
+# ---------------------------------------------------------------------------
+# Pending uploads (encoding choice not made yet)
+# ---------------------------------------------------------------------------
+
+def create_pending_upload(connection, token, filename, raw):
+    connection.execute(
+        "INSERT INTO pending_uploads (token, filename, raw) VALUES (?, ?, ?)",
+        (token, filename, sqlite3.Binary(bytes(raw))),
+    )
+    connection.commit()
+
+
+def get_pending_upload(connection, token):
+    row = connection.execute(
+        "SELECT token, filename, raw, job_id, created_at"
+        " FROM pending_uploads WHERE token = ?", (token,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def create_job_from_upload(connection, token, filename, boxes, horizontal, vertical):
+    """Create a job with its boxes and suggested lines in ONE transaction.
+
+    Returns the new job id.  When ``token`` is given, the pending upload is
+    marked with the job id inside the same transaction; if another confirm
+    already claimed that token, everything is rolled back and None is
+    returned, so a repeated confirm never creates a second job.  Any failure
+    rolls the whole import back — no half-created job is left behind.
+    """
+    try:
+        cursor = connection.execute(
+            "INSERT INTO jobs (filename) VALUES (?)", (filename,)
+        )
+        job_id = cursor.lastrowid
+        for row in boxes:
+            connection.execute(
+                "INSERT INTO boxes"
+                " (job_id, row_no, box_ref, text, x1, y1, x2, y2)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (job_id, row["row_no"], row["box_ref"], row["text"],
+                 row["x1"], row["y1"], row["x2"], row["y2"]),
+            )
+        for position in horizontal:
+            connection.execute(
+                "INSERT INTO lines (job_id, orientation, position) VALUES (?, 'h', ?)",
+                (job_id, position),
+            )
+        for position in vertical:
+            connection.execute(
+                "INSERT INTO lines (job_id, orientation, position) VALUES (?, 'v', ?)",
+                (job_id, position),
+            )
+        if token is not None:
+            claimed = connection.execute(
+                "UPDATE pending_uploads SET job_id = ?"
+                " WHERE token = ? AND job_id IS NULL",
+                (job_id, token),
+            )
+            if claimed.rowcount != 1:
+                connection.rollback()
+                return None
+        connection.commit()
+        return job_id
+    except Exception:
+        connection.rollback()
+        raise
